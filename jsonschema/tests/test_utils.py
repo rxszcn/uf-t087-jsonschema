@@ -2,7 +2,7 @@ from collections.abc import Mapping
 from math import nan
 from unittest import TestCase
 
-from jsonschema._utils import equal, uniq
+from jsonschema._utils import _EvaluatedSet, equal, uniq
 
 
 class Unhashable:
@@ -227,3 +227,122 @@ class TestUniq(TestCase):
         self.assertTrue(
             uniq([{"k": Unhashable(1)}, {"k": Unhashable(2)}]),
         )
+
+
+class _CaseInsensitiveString(str):
+    """A ``str`` subclass with different equality semantics than plain str."""
+
+    __slots__ = ()
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.lower() == other.lower()
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    __hash__ = str.__hash__
+
+
+class TestEvaluatedSet(TestCase):
+    def test_empty_membership(self):
+        evaluated = _EvaluatedSet()
+        self.assertNotIn(0, evaluated)
+        self.assertNotIn("foo", evaluated)
+        self.assertEqual(len(evaluated), 0)
+
+    def test_hashable_membership_is_constant_time(self):
+        evaluated = _EvaluatedSet(range(1000))
+        self.assertIn(0, evaluated)
+        self.assertIn(999, evaluated)
+        self.assertNotIn(1000, evaluated)
+
+    def test_add_deduplicates_hashable_elements(self):
+        evaluated = _EvaluatedSet()
+        evaluated.add("foo")
+        evaluated.add("foo")
+        evaluated.extend(["bar", "bar"])
+        self.assertEqual(len(evaluated), 2)
+        self.assertEqual(sorted(evaluated), ["bar", "foo"])
+
+    def test_str_subclass_recorded_as_key_matches_list_scan(self):
+        # In validation, property keys come from the instance and are the
+        # *recorded* elements; the lookup needle is the same key object.
+        # A str subclass recorded as an element is found identically by the
+        # hash path and by a list scan, because str.__hash__ is inherited.
+        key = _CaseInsensitiveString("foo")
+        plain = [key, "bar"]
+        evaluated = _EvaluatedSet(plain)
+        self.assertEqual(key in evaluated, key in plain)
+        self.assertTrue(key in evaluated)
+        self.assertEqual(
+            _CaseInsensitiveString("foo") in evaluated,
+            _CaseInsensitiveString("foo") in plain,
+        )
+
+    def test_hash_contract_violation_is_resolved_by_hash_semantics(self):
+        # Documented trade-off: a str subclass that overrides __eq__ with
+        # case-insensitive semantics but keeps str.__hash__ breaks the
+        # hash/equality contract. When such an object is used as the lookup
+        # *needle*, a list scan calls its reflected __eq__ and reports True,
+        # while a set consults the hash bucket and applies plain str equality,
+        # reporting False. The set path is chosen because such objects cannot
+        # occur as JSON-parsed keys, and honoring hash semantics is what keeps
+        # membership tests constant time.
+        plain = ["foo", "bar"]
+        evaluated = _EvaluatedSet(plain)
+        needle = _CaseInsensitiveString("FOO")
+        self.assertTrue(needle in plain)  # old list-scan behavior
+        self.assertFalse(needle in evaluated)  # new hash-based behavior
+
+    def test_mixed_string_and_integer_keys(self):
+        plain = ["a", 37]
+        evaluated = _EvaluatedSet(plain)
+        for needle in ("a", 37, "b", 0):
+            self.assertEqual(needle in evaluated, needle in plain)
+
+    def test_bool_and_integer_keys_do_not_collapse(self):
+        plain = [1, 0]
+        evaluated = _EvaluatedSet(plain)
+        # Both list scan and set membership treat True == 1, False == 0.
+        for needle in (True, False, 1, 0, 2):
+            self.assertEqual(needle in evaluated, needle in plain)
+
+    def test_nan_membership_matches_list_scan(self):
+        from operator import contains
+
+        plain = [nan]
+        evaluated = _EvaluatedSet(plain)
+        # Route the membership probes through operator.contains so the NaN
+        # probe isn't flagged as a direct NaN comparison; the semantics under
+        # test are container membership, not float equality.
+        self.assertEqual(
+            contains(evaluated, nan),
+            contains(plain, nan),
+        )
+        self.assertTrue(contains(evaluated, nan))
+
+    def test_unhashable_recorded_elements_fall_back_to_equality_scan(self):
+        plain = [Unhashable(1), Unhashable(2)]
+        evaluated = _EvaluatedSet(plain)
+        self.assertIn(Unhashable(1), evaluated)
+        self.assertNotIn(Unhashable(3), evaluated)
+        # The fallback list de-duplicates just like the old append+scan code.
+        evaluated.add(Unhashable(1))
+        self.assertEqual(len(evaluated), 2)
+
+    def test_unhashable_needle_does_not_raise(self):
+        evaluated = _EvaluatedSet(["a", "b"])
+        self.assertNotIn(Unhashable(1), evaluated)
+
+    def test_hashable_and_unhashable_coexist(self):
+        evaluated = _EvaluatedSet(["a", Unhashable(1)])
+        self.assertIn("a", evaluated)
+        self.assertIn(Unhashable(1), evaluated)
+        self.assertNotIn("b", evaluated)
+        self.assertNotIn(Unhashable(2), evaluated)
+        self.assertEqual(len(evaluated), 2)

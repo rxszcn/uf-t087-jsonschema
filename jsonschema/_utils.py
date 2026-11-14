@@ -10,6 +10,64 @@ _FALSE = object()
 _UNSUPPORTED = object()
 
 
+class _EvaluatedSet:
+    """
+    Constant-time membership tracking for evaluated indexes and property keys.
+
+    Hashable elements live in an underlying ``set`` so membership tests are
+    O(1); elements which cannot be hashed (e.g. an unhashable mapping used as
+    a property key) are kept in a fallback list scanned linearly, exactly as
+    the previous list-based implementation did.
+
+    Membership semantics deliberately match a plain list scan rather than a
+    plain set: every ``in`` check first tries the hash fast path and then, for
+    unhashable needles or elements that were themselves unhashable when
+    recorded, falls back to an equality scan. A type whose ``__eq__`` reports
+    equal to a ``str`` but whose ``__hash__`` breaks the hash contract is
+    therefore still resolved by equality, the same way ``key in [...]`` would
+    have resolved it. For every type that honors Python's hash/equality
+    contract -- including ``str`` subclasses, which inherit ``str.__hash__``
+    and so hash identically to plain strings -- the set path and the old list
+    scan give byte-for-byte identical answers.
+    """
+
+    __slots__ = ("_hashable", "_unhashable")
+
+    def __init__(self, iterable=()):
+        self._hashable = set()
+        self._unhashable = []
+        self.extend(iterable)
+
+    def add(self, element):
+        try:
+            self._hashable.add(element)
+        except TypeError:
+            if element not in self._unhashable:
+                self._unhashable.append(element)
+
+    def extend(self, elements):
+        for element in elements:
+            self.add(element)
+
+    def __contains__(self, element):
+        try:
+            if element in self._hashable:
+                return True
+        except TypeError:
+            pass
+        return element in self._unhashable
+
+    def __iter__(self):
+        yield from self._hashable
+        yield from self._unhashable
+
+    def __len__(self):
+        return len(self._hashable) + len(self._unhashable)
+
+    def __repr__(self):
+        return f"_EvaluatedSet({list(self)!r})"
+
+
 class URIDict(MutableMapping):
     """
     Dictionary which uses normalized URIs as keys.
@@ -242,13 +300,17 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
 
     Covers all keywords related to unevaluatedItems: items, prefixItems, if,
     then, else, contains, unevaluatedItems, allOf, oneOf, anyOf
+
+    Returns an `_EvaluatedSet`, whose membership tests are constant time for
+    the integer indexes produced here, so callers can scan a large instance
+    without quadratic list scans.
     """
     if validator.is_type(schema, "boolean"):
-        return []
-    evaluated_indexes = []
+        return _EvaluatedSet()
+    evaluated_indexes = _EvaluatedSet()
 
     if "items" in schema:
-        return list(range(len(instance)))
+        return _EvaluatedSet(range(len(instance)))
 
     ref = schema.get("$ref")
     if ref is not None:
@@ -279,43 +341,51 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
         )
 
     if "prefixItems" in schema:
-        evaluated_indexes += list(range(len(schema["prefixItems"])))
+        evaluated_indexes.extend(range(len(schema["prefixItems"])))
 
     if "if" in schema:
         if validator.evolve(schema=schema["if"]).is_valid(instance):
-            evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                validator,
-                instance,
-                schema["if"],
-            )
-            if "then" in schema:
-                evaluated_indexes += find_evaluated_item_indexes_by_schema(
+            evaluated_indexes.extend(
+                find_evaluated_item_indexes_by_schema(
                     validator,
                     instance,
-                    schema["then"],
+                    schema["if"],
+                ),
+            )
+            if "then" in schema:
+                evaluated_indexes.extend(
+                    find_evaluated_item_indexes_by_schema(
+                        validator,
+                        instance,
+                        schema["then"],
+                    ),
                 )
         elif "else" in schema:
-            evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                validator,
-                instance,
-                schema["else"],
+            evaluated_indexes.extend(
+                find_evaluated_item_indexes_by_schema(
+                    validator,
+                    instance,
+                    schema["else"],
+                ),
             )
 
     for keyword in ["contains", "unevaluatedItems"]:
         if keyword in schema:
             for k, v in enumerate(instance):
                 if validator.evolve(schema=schema[keyword]).is_valid(v):
-                    evaluated_indexes.append(k)
+                    evaluated_indexes.add(k)
 
     for keyword in ["allOf", "oneOf", "anyOf"]:
         if keyword in schema:
             for subschema in schema[keyword]:
                 errs = next(validator.descend(instance, subschema), None)
                 if errs is None:
-                    evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                        validator,
-                        instance,
-                        subschema,
+                    evaluated_indexes.extend(
+                        find_evaluated_item_indexes_by_schema(
+                            validator,
+                            instance,
+                            subschema,
+                        ),
                     )
 
     return evaluated_indexes
@@ -328,10 +398,14 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
     Covers all keywords related to unevaluatedProperties: properties,
     additionalProperties, unevaluatedProperties, patternProperties,
     dependentSchemas, allOf, oneOf, anyOf, if, then, else
+
+    Returns an `_EvaluatedSet`, whose membership tests are constant time for
+    hashable property keys, so callers can scan a large instance without
+    quadratic list scans.
     """
     if validator.is_type(schema, "boolean"):
-        return []
-    evaluated_keys = []
+        return _EvaluatedSet()
+    evaluated_keys = _EvaluatedSet()
 
     ref = schema.get("$ref")
     if ref is not None:
@@ -363,12 +437,14 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
 
     properties = schema.get("properties")
     if validator.is_type(properties, "object"):
-        evaluated_keys += properties.keys() & instance.keys()
+        # Only property names actually present in the instance are evaluated.
+        for property in properties.keys() & instance.keys():
+            evaluated_keys.add(property)
 
     for keyword in ["additionalProperties", "unevaluatedProperties"]:
         if (subschema := schema.get(keyword)) is None:
             continue
-        evaluated_keys += (
+        evaluated_keys.extend(
             key
             for key, value in instance.items()
             if is_valid(validator.descend(value, subschema))
@@ -378,46 +454,56 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
         for property in instance:
             for pattern in schema["patternProperties"]:
                 if re.search(pattern, property):
-                    evaluated_keys.append(property)
+                    evaluated_keys.add(property)
 
     if "dependentSchemas" in schema:
         for property, subschema in schema["dependentSchemas"].items():
             if property not in instance:
                 continue
-            evaluated_keys += find_evaluated_property_keys_by_schema(
-                validator,
-                instance,
-                subschema,
+            evaluated_keys.extend(
+                find_evaluated_property_keys_by_schema(
+                    validator,
+                    instance,
+                    subschema,
+                ),
             )
 
     for keyword in ["allOf", "oneOf", "anyOf"]:
         for subschema in schema.get(keyword, []):
             if not is_valid(validator.descend(instance, subschema)):
                 continue
-            evaluated_keys += find_evaluated_property_keys_by_schema(
-                validator,
-                instance,
-                subschema,
+            evaluated_keys.extend(
+                find_evaluated_property_keys_by_schema(
+                    validator,
+                    instance,
+                    subschema,
+                ),
             )
 
     if "if" in schema:
         if validator.evolve(schema=schema["if"]).is_valid(instance):
-            evaluated_keys += find_evaluated_property_keys_by_schema(
-                validator,
-                instance,
-                schema["if"],
-            )
-            if "then" in schema:
-                evaluated_keys += find_evaluated_property_keys_by_schema(
+            evaluated_keys.extend(
+                find_evaluated_property_keys_by_schema(
                     validator,
                     instance,
-                    schema["then"],
+                    schema["if"],
+                ),
+            )
+            if "then" in schema:
+                evaluated_keys.extend(
+                    find_evaluated_property_keys_by_schema(
+                        validator,
+                        instance,
+                        schema["then"],
+                    ),
                 )
         elif "else" in schema:
-            evaluated_keys += find_evaluated_property_keys_by_schema(
-                validator,
-                instance,
-                schema["else"],
+            evaluated_keys.extend(
+                find_evaluated_property_keys_by_schema(
+                    validator,
+                    instance,
+                    schema["else"],
+                ),
             )
 
     return evaluated_keys
